@@ -1,2 +1,2 @@
 # tcp
-This is the implementation of TCP/IP  stack from scratch
+This is the implementation of the TCP protocol from scratch
