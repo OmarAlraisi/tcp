@@ -1,6 +1,10 @@
 #!/bin/bash
-
 cargo b --release
+ext=$?
+if [[ $ext -ne 0 ]]; then
+    exit $ext
+fi;
+
 sudo setcap cap_net_admin=eip ./target/release/tcp
 ./target/release/tcp &
 pid=$!
