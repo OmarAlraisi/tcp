@@ -1,54 +1,54 @@
+mod tcp;
+
 use etherparse::{IpNumber, Ipv4HeaderSlice, TcpHeaderSlice};
-use std::io;
+use std::{collections::HashMap, io, net::Ipv4Addr};
 use tun_tap::{Iface, Mode};
 
-fn print_connection_info(ip_packet: Ipv4HeaderSlice, tcp_segment: TcpHeaderSlice) {
-    println!(
-        "{}:{} -> {}:{}",
-        ip_packet.source_addr(),
-        tcp_segment.source_port(),
-        ip_packet.destination_addr(),
-        tcp_segment.destination_port()
-    );
-}
-
-fn handle_frame(slice: &[u8]) {
-    // Ignore if not IPv4 packet
-    let proto = u16::from_be_bytes([slice[2], slice[3]]);
-    if proto != 0x0800 {
-        return;
-    }
-
-    // Parse IPv4 packet
-    let ip_packet = match Ipv4HeaderSlice::from_slice(&slice[4..]) {
-        Err(_) => return,
-        Ok(ip_packet) => {
-            if ip_packet.protocol() != IpNumber::TCP {
-                return;
-            }
-            ip_packet
-        }
-    };
-
-    // Parse TCP segment
-    let tcp_segment = match TcpHeaderSlice::from_slice(&slice[4 + ip_packet.slice().len()..]) {
-        Err(_) => return,
-        Ok(tcp_segment) => tcp_segment,
-    };
-
-    // Print connection details
-    print_connection_info(ip_packet, tcp_segment);
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+struct Quad {
+    local: (Ipv4Addr, u16),
+    remote: (Ipv4Addr, u16),
 }
 
 fn main() -> io::Result<()> {
     // Create a virtual tunnel nic
-    let nic = Iface::new("tun0", Mode::Tun)?;
+    let mut nic = Iface::new("tun0", Mode::Tun)?;
 
+    let mut connections: HashMap<Quad, tcp::Connection> = Default::default();
     let mut buf = [0u8; 1504];
     loop {
         // Read from the tunnel nic
         let len = nic.recv(&mut buf)?;
 
-        handle_frame(&buf[..len]);
+        // Ignore if not IPv4 packet
+        let proto = u16::from_be_bytes([buf[2], buf[3]]);
+        if proto != 0x0800 {
+            continue;
+        }
+
+        // Parse IPv4 packet
+        let iphdr = match Ipv4HeaderSlice::from_slice(&buf[4..len]) {
+            Err(_) => continue,
+            Ok(iphdr) => {
+                if iphdr.protocol() != IpNumber::TCP {
+                    continue;
+                }
+                iphdr
+            }
+        };
+
+        // Parse TCP segment
+        let tcphdr = match TcpHeaderSlice::from_slice(&buf[4 + iphdr.slice().len()..len]) {
+            Err(_) => continue,
+            Ok(tcphdr) => tcphdr,
+        };
+
+        connections
+            .entry(Quad {
+                local: (iphdr.source_addr(), tcphdr.source_port()),
+                remote: (iphdr.destination_addr(), tcphdr.destination_port()),
+            })
+            .or_default()
+            .on_packet(&mut nic, &iphdr, &tcphdr)?;
     }
 }
