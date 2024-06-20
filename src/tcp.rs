@@ -30,11 +30,11 @@ pub struct Connection {
 /// ```
 struct SendSequenceSpace {
     /// send unacknowledged
-    una: usize,
+    una: u32,
     /// send next
-    nxt: usize,
+    nxt: u32,
     /// send window
-    wnd: usize,
+    wnd: u16,
     /// send urgent pointer
     up: bool,
     /// segment sequence number used for last window update
@@ -42,20 +42,7 @@ struct SendSequenceSpace {
     /// segment acknowledgment number used for last window update
     wl2: usize,
     /// initial send sequence number
-    iss: usize,
-}
-impl Default for SendSequenceSpace {
-    fn default() -> Self {
-        Self {
-            una: Default::default(),
-            nxt: Default::default(),
-            wnd: Default::default(),
-            up: Default::default(),
-            wl1: Default::default(),
-            wl2: Default::default(),
-            iss: Default::default(),
-        }
-    }
+    iss: u32,
 }
 
 // For example if a segment has a SEG.SEQ of 1234 and its data has a length of 1250, then the next segment
@@ -84,80 +71,80 @@ struct RecvSequenceSpace {
     irs: u32,
 }
 
-impl Default for RecvSequenceSpace {
-    fn default() -> Self {
-        Self {
-            nxt: Default::default(),
-            wnd: Default::default(),
-            up: Default::default(),
-            irs: Default::default(),
-        }
-    }
-}
-
-impl Default for Connection {
-    fn default() -> Self {
-        Connection {
-            state: State::Listen,
-            send: Default::default(),
-            recv: Default::default(),
-        }
-    }
-}
-
 impl Connection {
-    pub fn on_packet<'a>(
-        &mut self,
+    pub fn accept<'a>(
         nic: &mut Iface,
         iphdr: &'a Ipv4HeaderSlice,
         tcphdr: &'a TcpHeaderSlice,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<Self>> {
         let mut buf = [0u8; 1500];
-        match self.state {
-            State::Closed => return Ok(()),
-            State::Listen => {
-                if !tcphdr.syn() {
-                    // Only expected SYN packets!
-                    return Ok(());
-                }
-
-                // Keep track of sender info
-                self.recv.irs = tcphdr.sequence_number();
-                self.recv.nxt = tcphdr.sequence_number() + 1;
-                self.recv.wnd = tcphdr.window_size();
-
-                // Create a packet to conitnue establishing the connection
-                let mut syn_ack_tcp = TcpHeader::new(
-                    tcphdr.destination_port(),
-                    tcphdr.source_port(),
-                    0,
-                    10,
-                );
-                syn_ack_tcp.acknowledgment_number = tcphdr.sequence_number() + 1;
-                syn_ack_tcp.syn = true;
-                syn_ack_tcp.ack = true;
-
-                let syn_ack_ip = Ipv4Header::new(
-                    syn_ack_tcp.header_len_u16(),
-                    64,
-                    IpNumber::TCP,
-                    iphdr.destination(),
-                    iphdr.source(),
-                )
-                .unwrap();
-
-                let unwritten = {
-                    let mut unwritten = &mut buf[..];
-                    syn_ack_ip.write(&mut unwritten)?;
-                    syn_ack_tcp.write(&mut unwritten)?;
-                    unwritten.len()
-                };
-                nic.send(&buf[..unwritten])?;
-            }
-            _ => {
-                println!("Do something!");
-            }
+        if !tcphdr.syn() {
+            // Only expected SYN packets!
+            return Ok(None);
         }
+
+        let iss = 0;
+        let mut connection = Connection {
+            state: State::SynRcvd,
+            send: SendSequenceSpace {
+                iss,
+                una: iss,
+                nxt: iss + 1,
+                wnd: 0,
+                up: false,
+                wl1: 0,
+                wl2: 0,
+            },
+            recv: RecvSequenceSpace {
+                nxt: 0,
+                wnd: 0,
+                up: false,
+                irs: 0,
+            },
+        };
+
+        // Keep track of sender info
+        connection.recv.irs = tcphdr.sequence_number();
+        connection.recv.nxt = tcphdr.sequence_number() + 1;
+        connection.recv.wnd = tcphdr.window_size();
+
+        // Decide what we are sending them
+        connection.send.iss = 0;
+        connection.send.una = connection.send.iss;
+        connection.send.nxt = connection.send.una;
+        connection.send.wnd = 10;
+
+        // Create a packet to conitnue establishing the connection
+        let mut syn_ack_tcp = TcpHeader::new(
+            tcphdr.destination_port(),
+            tcphdr.source_port(),
+            connection.send.iss,
+            connection.send.wnd,
+        );
+        syn_ack_tcp.acknowledgment_number = connection.recv.nxt;
+        syn_ack_tcp.syn = true;
+        syn_ack_tcp.ack = true;
+
+        let syn_ack_ip = Ipv4Header::new(
+            syn_ack_tcp.header_len_u16(),
+            64,
+            IpNumber::TCP,
+            iphdr.destination(),
+            iphdr.source(),
+        )
+        .unwrap();
+
+        syn_ack_tcp.checksum = syn_ack_tcp
+            .calc_checksum_ipv4(&syn_ack_ip, &[])
+            .expect("Failed to calculate checksum");
+
+        let unwritten = {
+            let mut unwritten = &mut buf[..];
+            syn_ack_ip.write(&mut unwritten)?;
+            syn_ack_tcp.write(&mut unwritten)?;
+            unwritten.len()
+        };
+        nic.send(&buf[..buf.len() - unwritten])?;
         let data_len = iphdr.total_len() - (iphdr.slice().len() + tcphdr.slice().len()) as u16;
 
         println!(
@@ -169,6 +156,15 @@ impl Connection {
             data_len,
         );
 
-        Ok(())
+        Ok(Some(connection))
+    }
+
+    pub fn on_packet<'a>(
+        &mut self,
+        nic: &mut Iface,
+        iphdr: &'a Ipv4HeaderSlice,
+        tcphdr: &'a TcpHeaderSlice,
+    ) -> io::Result<()> {
+        unimplemented!()
     }
 }

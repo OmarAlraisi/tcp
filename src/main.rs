@@ -1,7 +1,11 @@
 mod tcp;
 
 use etherparse::{IpNumber, Ipv4HeaderSlice, TcpHeaderSlice};
-use std::{collections::HashMap, io, net::Ipv4Addr};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    io,
+    net::Ipv4Addr,
+};
 use tun_tap::{Iface, Mode};
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -12,22 +16,17 @@ struct Quad {
 
 fn main() -> io::Result<()> {
     // Create a virtual tunnel nic
-    let mut nic = Iface::new("tun0", Mode::Tun)?;
+    let mut nic = Iface::without_packet_info("tun0", Mode::Tun)?;
 
     let mut connections: HashMap<Quad, tcp::Connection> = Default::default();
-    let mut buf = [0u8; 1504];
+    let mut buf = [0u8; 1500];
     loop {
         // Read from the tunnel nic
         let len = nic.recv(&mut buf)?;
 
-        // Ignore if not IPv4 packet
-        let proto = u16::from_be_bytes([buf[2], buf[3]]);
-        if proto != 0x0800 {
-            continue;
-        }
-
         // Parse IPv4 packet
         let iphdr = match Ipv4HeaderSlice::from_slice(&buf[4..len]) {
+            // Something other than IPv4
             Err(_) => continue,
             Ok(iphdr) => {
                 if iphdr.protocol() != IpNumber::TCP {
@@ -43,12 +42,18 @@ fn main() -> io::Result<()> {
             Ok(tcphdr) => tcphdr,
         };
 
-        connections
-            .entry(Quad {
-                local: (iphdr.source_addr(), tcphdr.source_port()),
-                remote: (iphdr.destination_addr(), tcphdr.destination_port()),
-            })
-            .or_default()
-            .on_packet(&mut nic, &iphdr, &tcphdr)?;
+        match connections.entry(Quad {
+            local: (iphdr.source_addr(), tcphdr.source_port()),
+            remote: (iphdr.destination_addr(), tcphdr.destination_port()),
+        }) {
+            Entry::Occupied(mut connection) => {
+                connection.get_mut().on_packet(&mut nic, &iphdr, &tcphdr)?;
+            }
+            Entry::Vacant(entry) => {
+                if let Some(connection) = tcp::Connection::accept(&mut nic, &iphdr, &tcphdr)? {
+                    entry.insert(connection);
+                }
+            }
+        }
     }
 }
