@@ -1,5 +1,5 @@
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
-use std::io;
+use std::io::{self, Write};
 use tun_tap::Iface;
 
 pub enum State {
@@ -7,11 +7,21 @@ pub enum State {
     Estab,
 }
 
+impl State {
+    fn is_synchronized(&self) -> bool {
+        match self {
+            State::SynRcvd => false,
+            State::Estab => true,
+        }
+    }
+}
+
 pub struct Connection {
     state: State,
     send: SendSequenceSpace,
     recv: RecvSequenceSpace,
     iphdr: Ipv4Header,
+    tcphdr: TcpHeader,
 }
 
 /// State of the Send Sequence Space. (RFC 9293 - Section 3.3.1 - Figure 3)
@@ -71,37 +81,84 @@ struct RecvSequenceSpace {
 }
 
 impl Connection {
+    /// Takes a nic and payload and writes an IP packet to the nic
+    /// Returns a result containing the number of payload bytes written to the nic
+    fn write(&mut self, nic: &mut Iface, payload: &[u8]) -> io::Result<usize> {
+        // Set the ip header payload
+        self.iphdr
+            .set_payload_len(self.tcphdr.header_len() + payload.len())
+            .expect("Payload length is too big!");
+
+        // Set the tcp header seqn, ackn, and checksum
+        self.tcphdr.sequence_number = self.send.nxt;
+        self.tcphdr.acknowledgment_number = self.recv.nxt;
+        self.tcphdr.checksum = self
+            .tcphdr
+            .calc_checksum_ipv4(&self.iphdr, &[])
+            .expect("Payload is too big!");
+
+        // Write to buffer and then to the nic
+        let mut buf = [0u8; 1500];
+        let (unwritten, payload_bytes) = {
+            let mut unwritten = &mut buf[..];
+            self.iphdr.write(&mut unwritten)?;
+            self.tcphdr.write(&mut unwritten)?;
+            let payload_bytes = unwritten.write(payload)?;
+            (unwritten.len(), payload_bytes)
+        };
+        nic.send(&buf[..buf.len() - unwritten])?;
+
+        Ok(payload_bytes)
+    }
+
+    /// Prepares TCP RST packets
+    // fn send_rst<'a>(&mut self, nic: &mut Iface, tcphdr: &'a TcpHeaderSlice) -> io::Result<()> {
+    //     if !self.state.is_synchronized() {
+    //         if tcphdr.ack() {
+    //             // Use the acknowledgment number from the received segment for the sequence number
+    //             self.tcphdr.sequence_number = tcphdr.acknowledgment_number();
+    //         } else {
+    //             // Use zero for the sequence number
+    //             self.tcphdr.sequence_number = 0;
+    //         }
+    //     }
+    //     self.tcphdr.rst = true;
+
+    //     self.write(nic, &[])?;
+    //     Ok(())
+    // }
+
+    fn reset_tcphdr_flags(&mut self) {
+        self.tcphdr.cwr = false;
+        self.tcphdr.ece = false;
+        self.tcphdr.urg = false;
+        self.tcphdr.ack = false;
+        self.tcphdr.psh = false;
+        self.tcphdr.rst = false;
+        self.tcphdr.syn = false;
+        self.tcphdr.fin = false;
+    }
+
     /// When accepting a new connection
     pub fn accept<'a>(
         nic: &mut Iface,
         iphdr: &'a Ipv4HeaderSlice,
         tcphdr: &'a TcpHeaderSlice,
     ) -> io::Result<Option<Self>> {
-        let mut buf = [0u8; 1500];
         if !tcphdr.syn() {
+            // TODO: Send RST (RFC 9293 - Section 3.5.1 - Group 1)
             return Ok(None);
         }
 
         // Create tcp and ip headers to send a syn_ack packet
         let iss = 0;
         let window_size = 10;
-        let mut syn_ack = TcpHeader::new(
-            tcphdr.destination_port(),
-            tcphdr.source_port(),
-            iss,
-            window_size,
-        );
-        syn_ack.acknowledgment_number = tcphdr.sequence_number() + 1;
-        syn_ack.syn = true;
-        syn_ack.ack = true;
-
-        // TODO: Shouldn't use the same window size set by the sender
         let mut connection = Connection {
             state: State::SynRcvd,
             send: SendSequenceSpace {
                 iss,
                 una: iss,
-                nxt: iss + 1,
+                nxt: iss,
                 wnd: window_size,
                 up: false,
                 wl1: 0,
@@ -113,33 +170,21 @@ impl Connection {
                 up: false,
                 irs: tcphdr.sequence_number(),
             },
-            iphdr: Ipv4Header::new(
-                syn_ack.header_len_u16(),
-                64,
-                IpNumber::TCP,
-                iphdr.destination(),
-                iphdr.source(),
-            )
-            .expect("Payload is too big!"),
+            iphdr: Ipv4Header::new(0, 64, IpNumber::TCP, iphdr.destination(), iphdr.source())
+                .expect("Payload is too big!"),
+            tcphdr: TcpHeader::new(
+                tcphdr.destination_port(),
+                tcphdr.source_port(),
+                iss,
+                window_size,
+            ),
         };
+        connection.tcphdr.syn = true;
+        connection.tcphdr.ack = true;
 
-        // Write the packet to the buffer and send it to the nic
-        syn_ack.checksum = syn_ack
-            .calc_checksum_ipv4(&connection.iphdr, &[])
-            .expect("Failed to calculate checksum!");
+        connection.write(nic, &[])?;
 
-        connection
-            .iphdr
-            .set_payload_len(syn_ack.header_len() + 0)
-            .expect("Payload size too big!");
-
-        let unwritten = {
-            let mut unwritten = &mut buf[..];
-            connection.iphdr.write(&mut unwritten)?;
-            syn_ack.write(&mut unwritten)?;
-            unwritten.len()
-        };
-        nic.send(&buf[..buf.len() - unwritten])?;
+        connection.send.nxt = connection.send.nxt.wrapping_add(1);
 
         Ok(Some(connection))
     }
@@ -148,7 +193,7 @@ impl Connection {
         &mut self,
         nic: &mut Iface,
         tcphdr: &'a TcpHeaderSlice,
-        data: &[u8],
+        payload: &[u8],
     ) -> io::Result<()> {
         // Acceptable ACK check. (RFC 9293 - Section 4.3)
         if !in_range_wrap(
@@ -156,23 +201,28 @@ impl Connection {
             tcphdr.acknowledgment_number(),
             self.send.nxt.wrapping_add(1),
         ) {
+            if !self.state.is_synchronized() {
+                // TODO: Send RST (RFC 9293 - Section 3.5.1 - Group 2)
+                // self.send_rst(nic, tcphdr)?;
+            }
             return Ok(());
         }
 
         // Validate segment. (RFC 9293 - Section 4.3)
-        // RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
-        // RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
-        let seqn = tcphdr.sequence_number();
-        match (data.len(), self.recv.wnd) {
+        let seg_seq = tcphdr.sequence_number();
+        // Because segment length counts fin and syn
+        let seg_len =
+            payload.len() as u32 + if tcphdr.fin() { 1 } else { 0 } + if tcphdr.syn() { 1 } else { 0 };
+        match (seg_len, self.recv.wnd) {
             (0, 0) => {
-                if seqn != self.recv.nxt {
+                if seg_seq != self.recv.nxt {
                     return Ok(());
                 }
             }
             (0, _) => {
                 if !in_range_wrap(
                     self.recv.nxt.wrapping_sub(1),
-                    seqn,
+                    seg_seq,
                     self.recv.nxt.wrapping_add(self.recv.wnd as u32),
                 ) {
                     return Ok(());
@@ -182,11 +232,11 @@ impl Connection {
             (_, _) => {
                 if !(in_range_wrap(
                     self.recv.nxt.wrapping_sub(1),
-                    seqn,
+                    seg_seq,
                     self.recv.nxt.wrapping_add(self.recv.wnd as u32),
                 ) && in_range_wrap(
                     self.recv.nxt.wrapping_sub(1),
-                    seqn + data.len() as u32 - 1,
+                    seg_seq + seg_len - 1,
                     self.recv.nxt.wrapping_add(self.recv.wnd as u32),
                 )) {
                     return Ok(());
@@ -194,31 +244,27 @@ impl Connection {
             }
         }
 
-        let mut buf = [0u8; 1500];
+        // Reset the tcp header flags regardless of the handler
+        self.reset_tcphdr_flags();
         match self.state {
             State::SynRcvd => {
-                if !(tcphdr.ack() && !tcphdr.syn()) {
+                // Since we only sent a syn segment, this has to be acking our syn segment
+                if !tcphdr.ack() {
                     return Ok(());
                 }
 
-                let mut rst_tcp = TcpHeader::new(
-                    tcphdr.destination_port(),
-                    tcphdr.source_port(),
-                    self.send.nxt,
-                    self.send.wnd,
-                );
-                self.send.nxt = tcphdr.sequence_number() + 1;
-
-                rst_tcp.rst = true;
-
-                let unwritten = {
-                    let mut unwritten = &mut buf[..];
-                    self.iphdr.write(&mut unwritten)?;
-                    rst_tcp.write(&mut unwritten)?;
-                    unwritten.len()
-                };
-                nic.send(&buf[..buf.len() - unwritten])?;
+                // Update the connection's state
                 self.state = State::Estab;
+
+                // Set the sequence number and the flags for the tcp header
+                self.tcphdr.fin = true;
+
+                // Write to the nic
+                self.write(nic, &[])?;
+
+                // Update the send sequence space
+                self.send.nxt = self.send.nxt.wrapping_add(payload.len() as u32).wrapping_add(1);
+
                 Ok(())
             }
             State::Estab => Ok(()),
