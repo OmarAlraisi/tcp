@@ -23,23 +23,28 @@ fn main() -> io::Result<()> {
     loop {
         // Read from the tunnel nic
         let len = nic.recv(&mut buf)?;
+        let mut offset = 0;
 
         // Parse IPv4 packet
-        let iphdr = match Ipv4HeaderSlice::from_slice(&buf[..len]) {
+        let iphdr = match Ipv4HeaderSlice::from_slice(&buf[offset..len]) {
             // Something other than IPv4
             Err(_) => continue,
             Ok(iphdr) => {
                 if iphdr.protocol() != IpNumber::TCP {
                     continue;
                 }
+                offset += iphdr.slice().len();
                 iphdr
             }
         };
 
         // Parse TCP segment
-        let tcphdr = match TcpHeaderSlice::from_slice(&buf[iphdr.slice().len()..len]) {
+        let tcphdr = match TcpHeaderSlice::from_slice(&buf[offset..len]) {
             Err(_) => continue,
-            Ok(tcphdr) => tcphdr,
+            Ok(tcphdr) => {
+                offset += tcphdr.slice().len();
+                tcphdr
+            }
         };
 
         match connections.entry(Quad {
@@ -47,7 +52,9 @@ fn main() -> io::Result<()> {
             remote: (iphdr.destination_addr(), tcphdr.destination_port()),
         }) {
             Entry::Occupied(mut connection) => {
-                connection.get_mut().on_packet(&mut nic, &iphdr, &tcphdr)?;
+                connection
+                    .get_mut()
+                    .on_packet(&mut nic, &tcphdr, &buf[offset..len])?;
             }
             Entry::Vacant(entry) => {
                 if let Some(connection) = tcp::Connection::accept(&mut nic, &iphdr, &tcphdr)? {
