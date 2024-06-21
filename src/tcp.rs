@@ -165,6 +165,6 @@ impl Connection {
         iphdr: &'a Ipv4HeaderSlice,
         tcphdr: &'a TcpHeaderSlice,
     ) -> io::Result<()> {
-        unimplemented!()
+        Ok(())
     }
 }

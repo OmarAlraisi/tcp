@@ -25,7 +25,7 @@ fn main() -> io::Result<()> {
         let len = nic.recv(&mut buf)?;
 
         // Parse IPv4 packet
-        let iphdr = match Ipv4HeaderSlice::from_slice(&buf[4..len]) {
+        let iphdr = match Ipv4HeaderSlice::from_slice(&buf[..len]) {
             // Something other than IPv4
             Err(_) => continue,
             Ok(iphdr) => {
@@ -37,7 +37,7 @@ fn main() -> io::Result<()> {
         };
 
         // Parse TCP segment
-        let tcphdr = match TcpHeaderSlice::from_slice(&buf[4 + iphdr.slice().len()..len]) {
+        let tcphdr = match TcpHeaderSlice::from_slice(&buf[iphdr.slice().len()..len]) {
             Err(_) => continue,
             Ok(tcphdr) => tcphdr,
         };
