@@ -108,6 +108,17 @@ impl Connection {
         };
         nic.send(&buf[..buf.len() - unwritten])?;
 
+        // Update the send next sequence number
+        self.send.nxt = self
+            .send
+            .nxt
+            .wrapping_add(payload_bytes as u32)
+            .wrapping_add(if self.tcphdr.syn || self.tcphdr.fin {
+                1
+            } else {
+                0
+            });
+
         Ok(payload_bytes)
     }
 
@@ -184,8 +195,6 @@ impl Connection {
 
         connection.write(nic, &[])?;
 
-        connection.send.nxt = connection.send.nxt.wrapping_add(1);
-
         Ok(Some(connection))
     }
 
@@ -210,9 +219,7 @@ impl Connection {
 
         // Validate segment. (RFC 9293 - Section 4.3)
         let seg_seq = tcphdr.sequence_number();
-        // Because segment length counts fin and syn
-        let seg_len =
-            payload.len() as u32 + if tcphdr.fin() { 1 } else { 0 } + if tcphdr.syn() { 1 } else { 0 };
+        let seg_len = payload.len() as u32 + if tcphdr.syn() || tcphdr.fin() { 1 } else { 0 };
         match (seg_len, self.recv.wnd) {
             (0, 0) => {
                 if seg_seq != self.recv.nxt {
@@ -261,9 +268,6 @@ impl Connection {
 
                 // Write to the nic
                 self.write(nic, &[])?;
-
-                // Update the send sequence space
-                self.send.nxt = self.send.nxt.wrapping_add(payload.len() as u32).wrapping_add(1);
 
                 Ok(())
             }
