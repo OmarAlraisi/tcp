@@ -1,21 +1,28 @@
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
-use std::cmp::Ordering;
-use std::io::{self, Write};
+use std::{
+    cmp::Ordering,
+    io::{self, Write},
+};
 use tun_tap::Iface;
 
 pub enum State {
     SynRcvd,
     Estab,
+    FinWait1,
+    FinWait2,
+    CloseWait,
+    Closing,
+    TimeWait,
 }
 
-impl State {
-    fn is_synchronized(&self) -> bool {
-        match self {
-            State::SynRcvd => false,
-            State::Estab => true,
-        }
-    }
-}
+// impl State {
+//     fn is_synchronized(&self) -> bool {
+//         match self {
+//             State::SynRcvd => false,
+//             _ => true,
+//         }
+//     }
+// }
 
 pub struct Connection {
     state: State,
@@ -48,9 +55,9 @@ struct SendSequenceSpace {
     /// urgent pointer
     up: bool,
     /// segment sequence number used for last window update
-    wl1: usize,
+    wl1: u32,
     /// segment acknowledgment number used for last window update
-    wl2: usize,
+    wl2: u32,
     /// initial send sequence number
     iss: u32,
 }
@@ -106,6 +113,7 @@ impl Connection {
             .tcphdr
             .calc_checksum_ipv4(&self.iphdr, &[])
             .expect("Payload is too big!");
+        self.tcphdr.ack = true;
 
         // Write to buffer and then to the nic
         let (unwritten, payload_bytes) = {
@@ -140,57 +148,57 @@ impl Connection {
     /// arrives that isn't intended for the current connection. And should handled based on the
     /// STATE group rules.
     ///
-    /// --- 
+    /// ---
     ///
     /// **Group 1**: The connection is in the `CLOSED` state.
     ///
     /// Send RST: True
     ///
-    /// If the incoming segment has the ACK bit set, the reset takes its sequence number from the 
-    /// ACK field of the segment; otherwise, the reset has sequence number zero and the ACK field 
-    /// is set to the sum of the sequence number and segment length of the incoming segment. The 
+    /// If the incoming segment has the ACK bit set, the reset takes its sequence number from the
+    /// ACK field of the segment; otherwise, the reset has sequence number zero and the ACK field
+    /// is set to the sum of the sequence number and segment length of the incoming segment. The
     /// connection remains in the CLOSED state.
     ///
     /// **Group 2**: The connection is not yet in a synchronized state.
     ///
     /// Send RST: True
     ///
-    /// If the incoming segment has an ACK field, the reset takes its sequence number from the ACK 
-    /// field of the segment; otherwise, the reset has sequence number zero and the ACK field is 
-    /// set to the sum of the sequence number and segment length of the incoming segment. The 
+    /// If the incoming segment has an ACK field, the reset takes its sequence number from the ACK
+    /// field of the segment; otherwise, the reset has sequence number zero and the ACK field is
+    /// set to the sum of the sequence number and segment length of the incoming segment. The
     /// connection remains in the same state.
     ///
     /// **Group 3**: The connection is in a synchronized state.
     ///
     /// Send RST: False
     ///
-    /// Must be responded to with an empty acknowledgment segment (without any user data) 
-    /// containing the current send sequence number and an acknowledgment indicating the next 
+    /// Must be responded to with an empty acknowledgment segment (without any user data)
+    /// containing the current send sequence number and an acknowledgment indicating the next
     /// sequence number expected to be received, and the connection remains in the same state.
     ///
-    fn send_rst<'a>(
-        &mut self,
-        nic: &mut Iface,
-        tcphdr: &'a TcpHeaderSlice,
-        payload: &[u8],
-    ) -> io::Result<()> {
-        if !self.state.is_synchronized() {
-            self.tcphdr.sequence_number = if tcphdr.ack() {
-                tcphdr.acknowledgment_number()
-            } else {
-                0
-            }
-            .wrapping_add(payload.len() as u32);
+    // fn send_rst<'a>(
+    //     &mut self,
+    //     nic: &mut Iface,
+    //     tcphdr: &'a TcpHeaderSlice,
+    //     payload: &[u8],
+    // ) -> io::Result<()> {
+    //     if !self.state.is_synchronized() {
+    //         self.tcphdr.sequence_number = if tcphdr.ack() {
+    //             tcphdr.acknowledgment_number()
+    //         } else {
+    //             0
+    //         }
+    //         .wrapping_add(payload.len() as u32);
 
-            self.tcphdr.acknowledgment_number =
-                tcphdr.sequence_number().wrapping_add(payload.len() as u32);
-        }
-        self.tcphdr.rst = true;
-        self.tcphdr.ack = true;
+    //         self.tcphdr.acknowledgment_number =
+    //             tcphdr.sequence_number().wrapping_add(payload.len() as u32);
+    //     }
+    //     self.tcphdr.rst = true;
+    //     self.tcphdr.ack = true;
 
-        self.write(nic, &[])?;
-        Ok(())
-    }
+    //     self.write(nic, &[])?;
+    //     Ok(())
+    // }
 
     /// Resets all tcp header flags
     ///
@@ -219,7 +227,7 @@ impl Connection {
 
         // Create tcp and ip headers to send a syn_ack packet
         let iss = 0;
-        let window_size = 10;
+        let window_size = tcphdr.window_size();
         let mut connection = Connection {
             state: State::SynRcvd,
             send: SendSequenceSpace {
@@ -260,21 +268,10 @@ impl Connection {
         tcphdr: &'a TcpHeaderSlice,
         payload: &[u8],
     ) -> io::Result<()> {
-        // Acceptable ACK check. (RFC 9293 - Section 4.3)
-        if !in_range_wrap(
-            self.send.una,
-            tcphdr.acknowledgment_number(),
-            self.send.nxt.wrapping_add(1),
-        ) {
-            if !self.state.is_synchronized() {
-                // Send RST (RFC 9293 - Section 3.5.1 - Group 2)
-                self.send_rst(nic, tcphdr, payload)?;
-            }
-            return Ok(());
-        }
-
         // Validate segment. (RFC 9293 - Section 4.3)
         let seg_seq = tcphdr.sequence_number();
+        let seg_ack = tcphdr.acknowledgment_number();
+        let seg_wnd = tcphdr.window_size();
         let seg_len = payload.len() as u32 + if tcphdr.syn() || tcphdr.fin() { 1 } else { 0 };
         match (seg_len, self.recv.wnd) {
             (0, 0) => {
@@ -283,26 +280,97 @@ impl Connection {
                 }
             }
             (0, _) => {
-                if !in_range_wrap(
+                if !is_in_range_wrap(
                     self.recv.nxt.wrapping_sub(1),
                     seg_seq,
                     self.recv.nxt.wrapping_add(self.recv.wnd as u32),
                 ) {
+                    // TODO: Send ACK
                     return Ok(());
                 }
             }
-            (_, 0) => return Ok(()),
+            (_, 0) => {
+                // TODO: IF the RCV.WND is zero, no segments will be acceptable, but special
+                // allowance should be made to accept valid ACKs, URGs, and RSTs.
+
+                // TODO: Send ACK
+                return Ok(());
+            }
             (_, _) => {
-                if !(in_range_wrap(
+                if !(is_in_range_wrap(
                     self.recv.nxt.wrapping_sub(1),
                     seg_seq,
                     self.recv.nxt.wrapping_add(self.recv.wnd as u32),
-                ) && in_range_wrap(
+                ) && is_in_range_wrap(
                     self.recv.nxt.wrapping_sub(1),
-                    seg_seq + seg_len - 1,
+                    seg_seq.wrapping_add(seg_len - 1),
                     self.recv.nxt.wrapping_add(self.recv.wnd as u32),
                 )) {
+                    // TODO: Send ACK
                     return Ok(());
+                }
+            }
+        }
+        // TODO: If an incoming segment is not acceptable, an acknowledgment should be sent in
+        // reply (unless the RST bit is set, if so drop the segment and return):
+        // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+
+        // TODO: Segments with higher beginning sequence numbers (than RCV.NXT) SHOULD be held
+        // for later processing (SHLD-31).
+
+        if tcphdr.syn() {
+            // TODO: Send a reset, any outstanding RECEIVEs and SEND should receive "reset"
+            // responses, all segment queues should be flushed, the user should also receive an
+            // unsolicited general "connection reset" signal, enter the CLOSED state, delete
+            // the TCB.
+
+            return Ok(());
+        }
+
+        // Acceptable ACK check. (RFC 9293 - Section 4.3)
+        if !tcphdr.ack() {
+            return Ok(());
+        }
+
+        if let State::SynRcvd = self.state {
+            if is_in_range_wrap(
+                self.send.una.wrapping_sub(1),
+                seg_ack,
+                self.send.nxt.wrapping_add(1),
+            ) {
+                self.state = State::Estab;
+                self.send.wnd = seg_wnd;
+                self.send.wl1 = seg_seq;
+                self.send.wl2 = seg_ack;
+            } else {
+                // TODO:
+                // <SEQ=SEG.ACK><CTL=RST>
+                // Send it
+                return Ok(());
+            }
+        }
+
+        if let State::TimeWait = self.state {
+            // This is the established ACK check
+            if !is_in_range_wrap(self.send.una, seg_ack, self.send.nxt.wrapping_add(1)) {
+                if !is_duplicate(self.send.una, seg_ack, self.send.nxt) {
+                    // TODO: Send an ACK
+                }
+                // if !self.state.is_synchronized() {
+                //     // Send RST (RFC 9293 - Section 3.5.1 - Group 2)
+                //     self.send_rst(nic, tcphdr, payload)?;
+                // }
+
+                return Ok(());
+            } else {
+                self.send.una = seg_ack;
+
+                if (self.send.wl1 < seg_seq)
+                    || (self.send.wl1 == seg_seq && self.send.wl2 <= seg_ack)
+                {
+                    self.send.wnd = seg_wnd;
+                    self.send.wl1 = seg_seq;
+                    self.send.wl2 = seg_ack;
                 }
             }
         }
@@ -310,25 +378,31 @@ impl Connection {
         // Reset the tcp header flags regardless of the handler
         self.reset_tcphdr_flags();
         match self.state {
-            State::SynRcvd => {
-                // Since we only sent a syn segment, this has to be acking our syn segment
-                if !tcphdr.ack() {
-                    return Ok(());
+            State::FinWait1 => {
+                if !tcphdr.fin() {
+                    // Normal Close Sequence (RFC 9293 - Section 3.6 - Case 1)
+                    self.state = State::FinWait2;
+                } else {
+                    // Simultaneous Close Sequence (RFC 9293 - Section 3.6 - Case 1)
+                    self.state = State::Closing;
                 }
-
-                // Update the connection's state
-                self.state = State::Estab;
-
-                // Set the sequence number and the flags for the tcp header
-                self.tcphdr.fin = true;
-
-                // Write to the nic
-                self.write(nic, &[])?;
-
-                Ok(())
             }
-            State::Estab => Ok(()),
-        }
+            State::FinWait2 => {
+                if tcphdr.fin() {
+                    // Normal Close Sequence (RFC 9293 - Section 3.6 - Case 1)
+                    self.state = State::TimeWait;
+                }
+            }
+            State::Closing => {
+                self.state = State::TimeWait;
+            }
+            _ => {}
+        };
+
+        let parsed = self.write(nic, payload)?;
+        self.recv.nxt = seg_seq.wrapping_add(parsed as u32);
+
+        Ok(())
     }
 }
 
@@ -374,10 +448,18 @@ impl Connection {
 ///
 ///  Condition: x > start || x < end
 /// ```
-fn in_range_wrap(start: u32, x: u32, end: u32) -> bool {
+fn is_in_range_wrap(start: u32, x: u32, end: u32) -> bool {
     match start.cmp(&end) {
         Ordering::Equal => false,
         Ordering::Less => x > start && x < end,
         Ordering::Greater => x < end || x > start,
+    }
+}
+
+fn is_duplicate(una: u32, ack: u32, nxt: u32) -> bool {
+    match una.cmp(&nxt) {
+        Ordering::Equal => unreachable!(),
+        Ordering::Less => ack < una,
+        Ordering::Greater => ack > nxt && ack < una,
     }
 }
