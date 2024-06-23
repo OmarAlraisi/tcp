@@ -1,4 +1,5 @@
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
+use std::cmp::Ordering;
 use std::io::{self, Write};
 use tun_tap::Iface;
 
@@ -84,9 +85,18 @@ impl Connection {
     /// Takes a nic and payload and writes an IP packet to the nic
     /// Returns a result containing the number of payload bytes written to the nic
     fn write(&mut self, nic: &mut Iface, payload: &[u8]) -> io::Result<usize> {
+        let mut buf = [0u8; 1500];
+
         // Set the ip header payload
+        let payload_len = {
+            let full_payload = self.iphdr.header_len() + self.tcphdr.header_len() + payload.len();
+            match buf.len().cmp(&full_payload) {
+                Ordering::Less | Ordering::Equal => buf.len() - self.iphdr.header_len(),
+                Ordering::Greater => self.tcphdr.header_len() + payload.len(),
+            }
+        };
         self.iphdr
-            .set_payload_len(self.tcphdr.header_len() + payload.len())
+            .set_payload_len(payload_len)
             .expect("Payload length is too big!");
 
         // Set the tcp header seqn, ackn, and checksum
@@ -98,7 +108,6 @@ impl Connection {
             .expect("Payload is too big!");
 
         // Write to buffer and then to the nic
-        let mut buf = [0u8; 1500];
         let (unwritten, payload_bytes) = {
             let mut unwritten = &mut buf[..];
             self.iphdr.write(&mut unwritten)?;
@@ -122,23 +131,70 @@ impl Connection {
         Ok(payload_bytes)
     }
 
-    /// Prepares TCP RST packets
-    // fn send_rst<'a>(&mut self, nic: &mut Iface, tcphdr: &'a TcpHeaderSlice) -> io::Result<()> {
-    //     if !self.state.is_synchronized() {
-    //         if tcphdr.ack() {
-    //             // Use the acknowledgment number from the received segment for the sequence number
-    //             self.tcphdr.sequence_number = tcphdr.acknowledgment_number();
-    //         } else {
-    //             // Use zero for the sequence number
-    //             self.tcphdr.sequence_number = 0;
-    //         }
-    //     }
-    //     self.tcphdr.rst = true;
+    // TODO: This function should send the packets itself rather than using Connection::write,
+    //       because it needs careful handling of the sequence and acknowledgement numbers, it
+    //       should also not modify the connection send and receive sequence spaces.
+    /// Sends TCP RST packets
+    ///
+    /// In accordance to RFC 9293 - Section 3.5.1, an RST packet is sent in when a TCP packet
+    /// arrives that isn't intended for the current connection. And should handled based on the
+    /// STATE group rules.
+    ///
+    /// --- 
+    ///
+    /// **Group 1**: The connection is in the `CLOSED` state.
+    ///
+    /// Send RST: True
+    ///
+    /// If the incoming segment has the ACK bit set, the reset takes its sequence number from the 
+    /// ACK field of the segment; otherwise, the reset has sequence number zero and the ACK field 
+    /// is set to the sum of the sequence number and segment length of the incoming segment. The 
+    /// connection remains in the CLOSED state.
+    ///
+    /// **Group 2**: The connection is not yet in a synchronized state.
+    ///
+    /// Send RST: True
+    ///
+    /// If the incoming segment has an ACK field, the reset takes its sequence number from the ACK 
+    /// field of the segment; otherwise, the reset has sequence number zero and the ACK field is 
+    /// set to the sum of the sequence number and segment length of the incoming segment. The 
+    /// connection remains in the same state.
+    ///
+    /// **Group 3**: The connection is in a synchronized state.
+    ///
+    /// Send RST: False
+    ///
+    /// Must be responded to with an empty acknowledgment segment (without any user data) 
+    /// containing the current send sequence number and an acknowledgment indicating the next 
+    /// sequence number expected to be received, and the connection remains in the same state.
+    ///
+    fn send_rst<'a>(
+        &mut self,
+        nic: &mut Iface,
+        tcphdr: &'a TcpHeaderSlice,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        if !self.state.is_synchronized() {
+            self.tcphdr.sequence_number = if tcphdr.ack() {
+                tcphdr.acknowledgment_number()
+            } else {
+                0
+            }
+            .wrapping_add(payload.len() as u32);
 
-    //     self.write(nic, &[])?;
-    //     Ok(())
-    // }
+            self.tcphdr.acknowledgment_number =
+                tcphdr.sequence_number().wrapping_add(payload.len() as u32);
+        }
+        self.tcphdr.rst = true;
+        self.tcphdr.ack = true;
 
+        self.write(nic, &[])?;
+        Ok(())
+    }
+
+    /// Resets all tcp header flags
+    ///
+    /// This function should be called as soon as a packet is recieved to avoid reusing flags.
     fn reset_tcphdr_flags(&mut self) {
         self.tcphdr.cwr = false;
         self.tcphdr.ece = false;
@@ -211,8 +267,8 @@ impl Connection {
             self.send.nxt.wrapping_add(1),
         ) {
             if !self.state.is_synchronized() {
-                // TODO: Send RST (RFC 9293 - Section 3.5.1 - Group 2)
-                // self.send_rst(nic, tcphdr)?;
+                // Send RST (RFC 9293 - Section 3.5.1 - Group 2)
+                self.send_rst(nic, tcphdr, payload)?;
             }
             return Ok(());
         }
@@ -319,15 +375,9 @@ impl Connection {
 ///  Condition: x > start || x < end
 /// ```
 fn in_range_wrap(start: u32, x: u32, end: u32) -> bool {
-    use std::cmp::Ordering;
     match start.cmp(&end) {
-        // Case I
         Ordering::Equal => false,
-
-        // Case II
         Ordering::Less => x > start && x < end,
-
-        // Case III
         Ordering::Greater => x < end || x > start,
     }
 }
