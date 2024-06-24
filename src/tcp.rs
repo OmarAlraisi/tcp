@@ -92,6 +92,7 @@ impl Connection {
     /// Takes a nic and payload and writes an IP packet to the nic
     /// Returns a result containing the number of payload bytes written to the nic
     fn write(&mut self, nic: &mut Iface, payload: &[u8]) -> io::Result<usize> {
+        self.tcphdr.ack = true;
         let mut buf = [0u8; 1500];
 
         // Set the ip header payload
@@ -111,9 +112,11 @@ impl Connection {
         self.tcphdr.acknowledgment_number = self.recv.nxt;
         self.tcphdr.checksum = self
             .tcphdr
-            .calc_checksum_ipv4(&self.iphdr, &[])
+            .calc_checksum_ipv4(
+                &self.iphdr,
+                &payload[..(payload_len - self.tcphdr.header_len())],
+            )
             .expect("Payload is too big!");
-        self.tcphdr.ack = true;
 
         // Write to buffer and then to the nic
         let (unwritten, payload_bytes) = {
@@ -339,9 +342,6 @@ impl Connection {
                 self.send.nxt.wrapping_add(1),
             ) {
                 self.state = State::Estab;
-                self.send.wnd = seg_wnd;
-                self.send.wl1 = seg_seq;
-                self.send.wl2 = seg_ack;
             } else {
                 // TODO:
                 // <SEQ=SEG.ACK><CTL=RST>
@@ -350,19 +350,13 @@ impl Connection {
             }
         }
 
-        if let State::TimeWait = self.state {
-            // This is the established ACK check
-            if !is_in_range_wrap(self.send.una, seg_ack, self.send.nxt.wrapping_add(1)) {
-                if !is_duplicate(self.send.una, seg_ack, self.send.nxt) {
-                    // TODO: Send an ACK
-                }
-                // if !self.state.is_synchronized() {
-                //     // Send RST (RFC 9293 - Section 3.5.1 - Group 2)
-                //     self.send_rst(nic, tcphdr, payload)?;
-                // }
-
-                return Ok(());
-            } else {
+        if let State::Estab
+        | State::FinWait1
+        | State::FinWait2
+        | State::CloseWait
+        | State::Closing = self.state
+        {
+            if is_in_range_wrap(self.send.una, seg_ack, self.send.nxt.wrapping_add(1)) {
                 self.send.una = seg_ack;
 
                 if (self.send.wl1 < seg_seq)
@@ -372,35 +366,46 @@ impl Connection {
                     self.send.wl1 = seg_seq;
                     self.send.wl2 = seg_ack;
                 }
+            } else {
+                if !is_duplicate(self.send.una, seg_ack, self.send.nxt) {
+                    // TODO: Send an ACK
+                    self.write(nic, &[])?;
+                }
+                // if !self.state.is_synchronized() {
+                //     // Send RST (RFC 9293 - Section 3.5.1 - Group 2)
+                //     self.send_rst(nic, tcphdr, payload)?;
+                // }
+
+                return Ok(());
+            }
+        }
+
+        if let State::FinWait1 = self.state {
+            self.state = State::FinWait2;
+        }
+        if let State::FinWait2 = self.state {
+            if tcphdr.fin() {
+                self.state = State::Closing;
+            }
+        }
+
+        if let State::Closing = self.state {
+            if seg_ack == self.send.nxt {
+                self.state = State::TimeWait;
             }
         }
 
         // Reset the tcp header flags regardless of the handler
         self.reset_tcphdr_flags();
-        match self.state {
-            State::FinWait1 => {
-                if !tcphdr.fin() {
-                    // Normal Close Sequence (RFC 9293 - Section 3.6 - Case 1)
-                    self.state = State::FinWait2;
-                } else {
-                    // Simultaneous Close Sequence (RFC 9293 - Section 3.6 - Case 1)
-                    self.state = State::Closing;
-                }
-            }
-            State::FinWait2 => {
-                if tcphdr.fin() {
-                    // Normal Close Sequence (RFC 9293 - Section 3.6 - Case 1)
-                    self.state = State::TimeWait;
-                }
-            }
-            State::Closing => {
-                self.state = State::TimeWait;
-            }
-            _ => {}
-        };
+        if let State::Estab = self.state {
+            self.tcphdr.fin = true;
+            self.state = State::FinWait1;
+        }
 
         let parsed = self.write(nic, payload)?;
-        self.recv.nxt = seg_seq.wrapping_add(parsed as u32);
+        self.recv.nxt = seg_seq
+            .wrapping_add(parsed as u32)
+            .wrapping_add(if tcphdr.fin() || tcphdr.syn() { 1 } else { 0 });
 
         Ok(())
     }
@@ -458,7 +463,7 @@ fn is_in_range_wrap(start: u32, x: u32, end: u32) -> bool {
 
 fn is_duplicate(una: u32, ack: u32, nxt: u32) -> bool {
     match una.cmp(&nxt) {
-        Ordering::Equal => unreachable!(),
+        Ordering::Equal => true,
         Ordering::Less => ack < una,
         Ordering::Greater => ack > nxt && ack < una,
     }
