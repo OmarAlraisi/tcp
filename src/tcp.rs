@@ -367,16 +367,19 @@ impl Connection {
                     self.send.wl2 = seg_ack;
                 }
             } else {
-                if !is_duplicate(self.send.una, seg_ack, self.send.nxt) {
-                    // TODO: Send an ACK
-                    self.write(nic, &[])?;
-                }
-                // if !self.state.is_synchronized() {
-                //     // Send RST (RFC 9293 - Section 3.5.1 - Group 2)
-                //     self.send_rst(nic, tcphdr, payload)?;
-                // }
+                if let State::FinWait2 = self.state {
+                } else {
+                    if !is_duplicate(self.send.una, seg_ack, self.send.nxt) {
+                        // TODO: Send an ACK
+                        self.write(nic, &[])?;
+                    }
+                    // if !self.state.is_synchronized() {
+                    //     // Send RST (RFC 9293 - Section 3.5.1 - Group 2)
+                    //     self.send_rst(nic, tcphdr, payload)?;
+                    // }
 
-                return Ok(());
+                    return Ok(());
+                }
             }
         }
 
@@ -392,6 +395,12 @@ impl Connection {
         if let State::Closing = self.state {
             if seg_ack == self.send.nxt {
                 self.state = State::TimeWait;
+            }
+        }
+
+        if let State::TimeWait = self.state {
+            if tcphdr.fin() {
+                self.recv.nxt = self.recv.nxt.wrapping_add(1);
             }
         }
 
