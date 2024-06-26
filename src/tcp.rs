@@ -1,7 +1,6 @@
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 use std::{
-    cmp::Ordering,
-    io::{self, Write},
+    cmp::Ordering, collections::VecDeque, io::{self, Write}
 };
 use tun_tap::Iface;
 
@@ -30,6 +29,9 @@ pub struct Connection {
     recv: RecvSequenceSpace,
     iphdr: Ipv4Header,
     tcphdr: TcpHeader,
+
+    pub(crate) inbuf: VecDeque<u8>,
+    pub(crate) outbuf: VecDeque<u8>,
 }
 
 /// State of the Send Sequence Space. (RFC 9293 - Section 3.3.1 - Figure 3)
@@ -256,6 +258,8 @@ impl Connection {
                 iss,
                 window_size,
             ),
+            inbuf: VecDeque::default(),
+            outbuf: VecDeque::default(),
         };
         connection.tcphdr.syn = true;
         connection.tcphdr.ack = true;
