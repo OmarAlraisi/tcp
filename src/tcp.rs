@@ -1,6 +1,8 @@
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 use std::{
-    cmp::Ordering, collections::VecDeque, io::{self, Write}
+    cmp::Ordering,
+    collections::VecDeque,
+    io::{self, Write},
 };
 use tun_tap::Iface;
 

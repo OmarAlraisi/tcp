@@ -22,6 +22,7 @@ struct Quad {
 
 #[derive(Default)]
 struct ConnectionManager {
+    terminate: bool,
     connections: HashMap<Quad, tcp::Connection>,
     pending: HashMap<u16, VecDeque<Quad>>,
 }
@@ -30,17 +31,39 @@ type ConnectionManagerLock = Arc<Mutex<ConnectionManager>>;
 
 pub struct Tcp {
     /// Conection handler
-    conn_manager: ConnectionManagerLock,
-    join_handler: thread::JoinHandle<io::Result<()>>,
+    conn_manager: Option<ConnectionManagerLock>,
+    join_handler: Option<thread::JoinHandle<io::Result<()>>>,
+}
+
+impl Drop for Tcp {
+    fn drop(&mut self) {
+        // Set connection manager's terminate to true
+        self.conn_manager
+            .as_mut()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .terminate = true;
+
+        // Drop the connection manager
+        drop(self.conn_manager.take());
+
+        // Wait for the packet processing thread to finish
+        self.join_handler.take().unwrap().join().unwrap().unwrap();
+    }
 }
 
 fn packet_loop(mut nic: tun_tap::Iface, conn_manager: ConnectionManagerLock) -> io::Result<()> {
     let mut buf = [0u8; 1500];
     loop {
         // Read from the tunnel nic
+        // TODO: Set timeout for the recv
         let len = nic.recv(&mut buf)?;
-        let mut offset = 0;
 
+        // TODO: if conn_manager.terminate && Arc get_strong_refs(conn_manager) == 1; then tear
+        // down all connections and return.
+
+        let mut offset = 0;
         // Parse IPv4 packet
         let iphdr = match Ipv4HeaderSlice::from_slice(&buf[offset..len]) {
             // Something other than IPv4
@@ -97,28 +120,31 @@ impl Tcp {
             thread::spawn(move || packet_loop(nic, cm))
         };
         Ok(Tcp {
-            conn_manager,
-            join_handler,
+            conn_manager: Some(conn_manager),
+            join_handler: Some(join_handler),
         })
     }
 
     /// Binds to a new port.
     pub fn bind(&mut self, port: u16) -> io::Result<TcpListener> {
-        let mut cm = self.conn_manager.lock().unwrap();
+        let mut cm = self.conn_manager.as_mut().unwrap().lock().unwrap();
 
         match cm.pending.entry(port) {
             Entry::Vacant(e) => {
                 e.insert(VecDeque::new());
             }
             Entry::Occupied(_) => {
-                return Err(io::Error::new(io::ErrorKind::AddrInUse, "port is bound!"));
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "port already bound!",
+                ));
             }
         }
         drop(cm);
 
         Ok(TcpListener {
             port,
-            conn_manager: self.conn_manager.clone(),
+            conn_manager: self.conn_manager.as_mut().unwrap().clone(),
         })
     }
 }
@@ -131,7 +157,17 @@ pub struct TcpListener {
 impl Drop for TcpListener {
     fn drop(&mut self) {
         let mut cm = self.conn_manager.lock().unwrap();
-        cm.pending.remove(&self.port);
+        let pending = cm
+            .pending
+            .remove(&self.port)
+            .expect("port closed while listener is active!");
+
+        for quad in pending {
+            // TODO: terminate connection
+            // cm.connections.get_mut(&quad)
+
+            unimplemented!()
+        }
     }
 }
 impl TcpListener {
@@ -249,7 +285,10 @@ impl TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        // TODO: send a FIN
-        unimplemented!()
+        let mut cm = self.conn_manager.lock().unwrap();
+        if let Some(connection) = cm.connections.remove(&self.quad) {
+            // TODO: send a FIN
+            unimplemented!()
+        }
     }
 }
