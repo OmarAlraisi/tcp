@@ -1,66 +1,22 @@
-mod tcp;
-
-use etherparse::{IpNumber, Ipv4HeaderSlice, TcpHeaderSlice};
+use ruts_tcp::Tcp;
 use std::{
-    collections::{hash_map::Entry, HashMap},
-    io,
-    net::Ipv4Addr,
+    io::{self, Read},
+    thread,
 };
-use tun_tap::{Iface, Mode};
-
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-struct Quad {
-    local: (Ipv4Addr, u16),
-    remote: (Ipv4Addr, u16),
-}
 
 fn main() -> io::Result<()> {
-    // Create a virtual tunnel nic
-    let mut nic = Iface::without_packet_info("tun0", Mode::Tun)?;
-
-    let mut connections: HashMap<Quad, tcp::Connection> = Default::default();
-    let mut buf = [0u8; 1500];
-    loop {
-        // Read from the tunnel nic
-        let len = nic.recv(&mut buf)?;
-        let mut offset = 0;
-
-        // Parse IPv4 packet
-        let iphdr = match Ipv4HeaderSlice::from_slice(&buf[offset..len]) {
-            // Something other than IPv4
-            Err(_) => continue,
-            Ok(iphdr) => {
-                if iphdr.protocol() != IpNumber::TCP {
-                    continue;
-                }
-                offset += iphdr.slice().len();
-                iphdr
-            }
-        };
-
-        // Parse TCP segment
-        let tcphdr = match TcpHeaderSlice::from_slice(&buf[offset..len]) {
-            Err(_) => continue,
-            Ok(tcphdr) => {
-                offset += tcphdr.slice().len();
-                tcphdr
-            }
-        };
-
-        match connections.entry(Quad {
-            local: (iphdr.source_addr(), tcphdr.source_port()),
-            remote: (iphdr.destination_addr(), tcphdr.destination_port()),
-        }) {
-            Entry::Occupied(mut connection) => {
-                connection
-                    .get_mut()
-                    .on_packet(&mut nic, &tcphdr, &buf[offset..len])?;
-            }
-            Entry::Vacant(entry) => {
-                if let Some(connection) = tcp::Connection::accept(&mut nic, &iphdr, &tcphdr)? {
-                    entry.insert(connection);
-                }
-            }
+    let mut tcp = Tcp::init()?;
+    let mut listener = tcp.bind(8080)?;
+    let jh: thread::JoinHandle<io::Result<()>> = thread::spawn(move || loop {
+        let mut stream = listener.accept()?;
+        println!("Got new stream connection");
+        loop {
+            let mut buf = [0; 1024];
+            stream.read(&mut buf)?;
+            let got = String::from_utf8_lossy(&buf[..]);
+            println!("Got: {}", got);
         }
-    }
+    });
+
+    jh.join().unwrap()
 }

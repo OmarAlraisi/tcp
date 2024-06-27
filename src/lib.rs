@@ -1,7 +1,8 @@
 mod tcp;
-use std::collections::hash_map::Entry;
+
+use etherparse::{IpNumber, Ipv4HeaderSlice, TcpHeaderSlice};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{hash_map::Entry, HashMap, VecDeque},
     io::{
         self,
         prelude::{Read, Write},
@@ -30,10 +31,60 @@ type ConnectionManagerLock = Arc<Mutex<ConnectionManager>>;
 pub struct Tcp {
     /// Conection handler
     conn_manager: ConnectionManagerLock,
-    join_handler: thread::JoinHandle<()>,
+    join_handler: thread::JoinHandle<io::Result<()>>,
 }
 
-fn packet_loop(nic: tun_tap::Iface, conn_manager: ConnectionManagerLock) {
+fn packet_loop(mut nic: tun_tap::Iface, conn_manager: ConnectionManagerLock) -> io::Result<()> {
+    let mut buf = [0u8; 1500];
+    loop {
+        // Read from the tunnel nic
+        let len = nic.recv(&mut buf)?;
+        let mut offset = 0;
+
+        // Parse IPv4 packet
+        let iphdr = match Ipv4HeaderSlice::from_slice(&buf[offset..len]) {
+            // Something other than IPv4
+            Err(_) => continue,
+            Ok(iphdr) => {
+                if iphdr.protocol() != IpNumber::TCP {
+                    continue;
+                }
+                offset += iphdr.slice().len();
+                iphdr
+            }
+        };
+
+        // Parse TCP segment
+        let tcphdr = match TcpHeaderSlice::from_slice(&buf[offset..len]) {
+            Err(_) => continue,
+            Ok(tcphdr) => {
+                offset += tcphdr.slice().len();
+                tcphdr
+            }
+        };
+
+        let mut cm = conn_manager.lock().unwrap();
+        let cm = &mut *cm;
+        let quad = Quad {
+            local: (iphdr.destination_addr(), tcphdr.destination_port()),
+            remote: (iphdr.source_addr(), tcphdr.source_port()),
+        };
+        match cm.connections.entry(quad) {
+            Entry::Occupied(mut connection) => {
+                connection
+                    .get_mut()
+                    .on_packet(&mut nic, &tcphdr, &buf[offset..len])?;
+            }
+            Entry::Vacant(entry) => {
+                if let Some(pending) = cm.pending.get_mut(&tcphdr.destination_port()) {
+                    if let Some(connection) = tcp::Connection::accept(&mut nic, &iphdr, &tcphdr)? {
+                        entry.insert(connection);
+                        pending.push_front(quad)
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Tcp {
@@ -41,15 +92,14 @@ impl Tcp {
     pub fn init() -> io::Result<Self> {
         let nic = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
         let conn_manager: ConnectionManagerLock = Arc::default();
-        let cm = conn_manager.clone();
-        let join_handler = thread::spawn(move || {
-            let nic = nic;
-            let cm = cm;
-            let _buf = [0u8; 1500];
-
-            packet_loop(nic, cm);
-        });
-        Ok(Tcp { conn_manager, join_handler })
+        let join_handler = {
+            let cm = conn_manager.clone();
+            thread::spawn(move || packet_loop(nic, cm))
+        };
+        Ok(Tcp {
+            conn_manager,
+            join_handler,
+        })
     }
 
     /// Binds to a new port.
@@ -78,8 +128,14 @@ pub struct TcpListener {
     conn_manager: ConnectionManagerLock,
 }
 
+impl Drop for TcpListener {
+    fn drop(&mut self) {
+        let mut cm = self.conn_manager.lock().unwrap();
+        cm.pending.remove(&self.port);
+    }
+}
 impl TcpListener {
-    fn try_accept(&mut self, buf: &mut [u8]) -> io::Result<TcpStream> {
+    pub fn accept(&mut self) -> io::Result<TcpStream> {
         let mut cm = self.conn_manager.lock().unwrap();
         if let Some(quad) = cm
             .pending
@@ -186,6 +242,13 @@ impl Write for TcpStream {
 
 impl TcpStream {
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        // TODO: send a FIN
+        unimplemented!()
+    }
+}
+
+impl Drop for TcpStream {
+    fn drop(&mut self) {
         // TODO: send a FIN
         unimplemented!()
     }
