@@ -25,33 +25,36 @@ struct ConnectionManager {
     pending: HashMap<u16, VecDeque<Quad>>,
 }
 
-type TcpHandler = Arc<Mutex<ConnectionManager>>;
+type ConnectionManagerLock = Arc<Mutex<ConnectionManager>>;
 
 pub struct Tcp {
-    ih: TcpHandler,
-    jh: thread::JoinHandle<()>,
+    /// Conection handler
+    conn_manager: ConnectionManagerLock,
+    join_handler: thread::JoinHandle<()>,
+}
+
+fn packet_loop(nic: tun_tap::Iface, conn_manager: ConnectionManagerLock) {
 }
 
 impl Tcp {
     /// Creates a new NIC and initializes the connection manager state
     pub fn init() -> io::Result<Self> {
         let nic = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
-        let ih: TcpHandler = Arc::default();
-        let cm = ih.clone();
-        let jh = thread::spawn(move || {
-            let _nic = nic;
-            let _cm = cm;
+        let conn_manager: ConnectionManagerLock = Arc::default();
+        let cm = conn_manager.clone();
+        let join_handler = thread::spawn(move || {
+            let nic = nic;
+            let cm = cm;
             let _buf = [0u8; 1500];
 
-            // TODO: This thread is for managing timers and recieving packets from the nic.
-            unimplemented!()
+            packet_loop(nic, cm);
         });
-        Ok(Tcp { ih, jh })
+        Ok(Tcp { conn_manager, join_handler })
     }
 
     /// Binds to a new port.
     pub fn bind(&mut self, port: u16) -> io::Result<TcpListener> {
-        let mut cm = self.ih.lock().unwrap();
+        let mut cm = self.conn_manager.lock().unwrap();
 
         match cm.pending.entry(port) {
             Entry::Vacant(e) => {
@@ -65,20 +68,20 @@ impl Tcp {
 
         Ok(TcpListener {
             port,
-            ih: self.ih.clone(),
+            conn_manager: self.conn_manager.clone(),
         })
     }
 }
 
 pub struct TcpListener {
     port: u16,
-    ih: TcpHandler,
+    conn_manager: ConnectionManagerLock,
 }
 
 impl TcpListener {
     fn try_accept(&mut self, buf: &mut [u8]) -> io::Result<TcpStream> {
-        let mut ih = self.ih.lock().unwrap();
-        if let Some(quad) = ih
+        let mut cm = self.conn_manager.lock().unwrap();
+        if let Some(quad) = cm
             .pending
             .get_mut(&self.port)
             .expect("port closed while listener is active!")
@@ -86,7 +89,7 @@ impl TcpListener {
         {
             Ok(TcpStream {
                 quad,
-                ih: self.ih.clone(),
+                conn_manager: self.conn_manager.clone(),
             })
         } else {
             // TODO: block
@@ -100,12 +103,12 @@ impl TcpListener {
 
 pub struct TcpStream {
     quad: Quad,
-    ih: TcpHandler,
+    conn_manager: ConnectionManagerLock,
 }
 
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut cm = self.ih.lock().unwrap();
+        let mut cm = self.conn_manager.lock().unwrap();
         let connection = cm.connections.get_mut(&self.quad).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::ConnectionAborted,
@@ -137,7 +140,7 @@ impl Read for TcpStream {
 
 impl Write for TcpStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut cm = self.ih.lock().unwrap();
+        let mut cm = self.conn_manager.lock().unwrap();
         let connection = cm.connections.get_mut(&self.quad).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::ConnectionAborted,
@@ -161,7 +164,7 @@ impl Write for TcpStream {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let mut cm = self.ih.lock().unwrap();
+        let mut cm = self.conn_manager.lock().unwrap();
         let connection = cm.connections.get_mut(&self.quad).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::ConnectionAborted,
