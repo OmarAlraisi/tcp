@@ -6,6 +6,7 @@ use std::{
 };
 use tun_tap::Iface;
 
+#[derive(Debug)]
 pub enum State {
     SynRcvd,
     Estab,
@@ -25,6 +26,7 @@ pub enum State {
 //     }
 // }
 
+#[derive(Debug)]
 pub struct Connection {
     state: State,
     send: SendSequenceSpace,
@@ -49,6 +51,7 @@ pub struct Connection {
 ///  3 - sequence numbers allowed for new data transmission
 ///  4 - future sequence numbers that are not yet allowed
 /// ```
+#[derive(Debug)]
 struct SendSequenceSpace {
     /// unacknowledged
     una: u32,
@@ -81,6 +84,7 @@ struct SendSequenceSpace {
 ///  2 - sequence numbers allowed for new reception
 ///  3 - future sequence numbers that are not yet allowed
 /// ```
+#[derive(Debug)]
 struct RecvSequenceSpace {
     /// next
     nxt: u32,
