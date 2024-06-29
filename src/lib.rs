@@ -110,6 +110,12 @@ fn packet_loop(mut nic: tun_tap::Iface, conn_handler: ConnectionHandler) -> io::
                         .get_mut()
                         .on_packet(&mut nic, &tcphdr, &buf[offset..len])?;
 
+                // remove the connection from the connections map if closed
+                if connection.get().is_closed() {
+                    connection.remove();
+                    continue;
+                }
+
                 // TODO: compare before/after and do the following only if they differ
                 drop(cm_lock);
                 if available.contains(tcp::Available::READ) {
@@ -242,23 +248,21 @@ impl Read for TcpStream {
             }
 
             if !connection.inbuf.is_empty() {
-                println!("-- Read awake");
                 let connection = cm.connections.get_mut(&self.quad).unwrap();
 
                 // TODO: detect FIN and return nread 0
 
                 let (head, tail) = connection.inbuf.as_slices();
                 let mut nread = std::cmp::min(head.len(), buf.len());
-                buf.copy_from_slice(&head[..nread]);
+                buf[..nread].copy_from_slice(&head[..nread]);
                 let tread = std::cmp::min(buf.len() - nread, tail.len());
-                buf.copy_from_slice(&tail[..tread]);
+                buf[nread..nread + tread].copy_from_slice(&head[..tread]);
                 nread += tread;
                 drop(connection.inbuf.drain(..nread));
 
                 return Ok(nread);
             }
 
-            println!("-- Read block");
             cm = self.conn_handler.receive_cvar.wait(cm).unwrap();
         }
     }

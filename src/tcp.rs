@@ -23,6 +23,8 @@ pub enum State {
     CloseWait,
     Closing,
     TimeWait,
+    LastAck,
+    Closed,
 }
 
 // impl State {
@@ -55,14 +57,23 @@ impl Connection {
         }
     }
 
-    pub fn availability(&self) -> Available {
-        // TODO: take self.state into considerations
+    fn availability(&self) -> Available {
         let mut availability = Available::empty();
         if self.is_recv_closed() || !self.inbuf.is_empty() {
             availability |= Available::READ;
         }
         // TODO: set Available::WRITE
         availability
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        // TODO: Verify this is the only state where we delete the connection, otherwise, we only
+        // delete connections after timers that are also in TIME-WAIT states.
+        if let State::Closed = self.state {
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -450,6 +461,21 @@ impl Connection {
                 self.recv.nxt = self.recv.nxt.wrapping_add(1);
                 self.state = State::CloseWait;
             }
+
+            if tcphdr.psh() {
+                self.inbuf.write_all(&payload)?;
+            }
+        }
+
+        if let State::CloseWait = self.state {
+            if self.outbuf.is_empty() {
+                self.tcphdr.fin = true;
+                self.state = State::LastAck;
+            }
+        }
+
+        if let State::LastAck = self.state {
+            self.state = State::Closed;
         }
 
         let parsed = self.write(nic, payload)?;
