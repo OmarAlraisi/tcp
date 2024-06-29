@@ -35,6 +35,7 @@ struct ConnHandler {
     // TODO: make the condvars per connection (i.e. per quad)
     pending_cvar: Condvar,
     receive_cvar: Condvar,
+    send_cvar: Condvar,
 }
 
 type ConnectionHandler = Arc<ConnHandler>;
@@ -269,47 +270,44 @@ impl Read for TcpStream {
 }
 
 impl Write for TcpStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut cm = self.conn_handler.conn_manager.lock().unwrap();
-        let connection = cm.connections.get_mut(&self.quad).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "stream terminated unexpectedly!",
-            )
-        })?;
 
-        if connection.outbuf.len() >= TRANSMISSION_QLEN_SIZE {
-            // TODO: block user
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "too many bytes buffered.",
-            ));
+        loop {
+            let connection = cm.connections.get_mut(&self.quad).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "stream terminated unexpectedly!",
+                )
+            })?;
+
+            if connection.outbuf.len() < TRANSMISSION_QLEN_SIZE {
+                let nwrite =
+                    std::cmp::min(buf.len(), TRANSMISSION_QLEN_SIZE - connection.outbuf.len());
+                connection.outbuf.extend(&buf[..nwrite]);
+
+                return Ok(nwrite);
+            }
+
+            cm = self.conn_handler.send_cvar.wait(cm).unwrap();
         }
-
-        let nwrite = std::cmp::min(buf.len(), TRANSMISSION_QLEN_SIZE - connection.outbuf.len());
-        connection.outbuf.extend(&buf[..nwrite]);
-        drop(cm);
-
-        Ok(nwrite)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         let mut cm = self.conn_handler.conn_manager.lock().unwrap();
-        let connection = cm.connections.get_mut(&self.quad).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "stream terminated unexpectedly!",
-            )
-        })?;
+        loop {
+            let connection = cm.connections.get(&self.quad).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "stream terminated unexpectedly!",
+                )
+            })?;
 
-        if connection.outbuf.is_empty() {
-            Ok(())
-        } else {
-            // TODO: block until outbuf is empty
-            Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "outgoing buffer is not yet flushed",
-            ))
+            if connection.outbuf.is_empty() {
+                return Ok(());
+            }
+
+            cm = self.conn_handler.send_cvar.wait(cm).unwrap();
         }
     }
 }
