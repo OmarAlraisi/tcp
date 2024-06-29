@@ -7,7 +7,7 @@ use std::{
         self,
         prelude::{Read, Write},
     },
-    net::Ipv4Addr,
+    net::{Ipv4Addr, ToSocketAddrs},
     sync::{Arc, Condvar, Mutex},
     thread,
 };
@@ -313,6 +313,10 @@ impl Write for TcpStream {
 }
 
 impl TcpStream {
+    pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
+        // TODO: https://github.com/rust-lang/rust/blob/19a1d2b404e9f56eb1792cc06ec3c86b5a260b41/library/std/src/sys_common/net.rs#L230
+        unimplemented!()
+    }
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
         // TODO: send a FIN
         unimplemented!()
