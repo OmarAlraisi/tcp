@@ -1,3 +1,4 @@
+use bitflags::bitflags;
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 use std::{
     cmp::Ordering,
@@ -5,6 +6,13 @@ use std::{
     io::{self, Write},
 };
 use tun_tap::Iface;
+
+bitflags! {
+    pub(crate) struct Available: u8 {
+        const READ = 1 << 0;
+        const WRITE = 1 << 1;
+    }
+}
 
 #[derive(Debug)]
 pub enum State {
@@ -36,6 +44,26 @@ pub struct Connection {
 
     pub(crate) inbuf: VecDeque<u8>,
     pub(crate) outbuf: VecDeque<u8>,
+}
+
+impl Connection {
+    pub(crate) fn is_recv_closed(&self) -> bool {
+        if let State::TimeWait | State::CloseWait | State::Closing = self.state {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn availability(&self) -> Available {
+        // TODO: take self.state into considerations
+        let mut availability = Available::empty();
+        if self.is_recv_closed() || !self.inbuf.is_empty() {
+            availability |= Available::READ;
+        }
+        // TODO: set Available::WRITE
+        availability
+    }
 }
 
 /// State of the Send Sequence Space. (RFC 9293 - Section 3.3.1 - Figure 3)
@@ -275,12 +303,12 @@ impl Connection {
         Ok(Some(connection))
     }
 
-    pub fn on_packet<'a>(
+    pub(crate) fn on_packet<'a>(
         &mut self,
         nic: &mut Iface,
         tcphdr: &'a TcpHeaderSlice,
         payload: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<Available> {
         // Validate segment. (RFC 9293 - Section 4.3)
         let seg_seq = tcphdr.sequence_number();
         let seg_ack = tcphdr.acknowledgment_number();
@@ -289,7 +317,7 @@ impl Connection {
         match (seg_len, self.recv.wnd) {
             (0, 0) => {
                 if seg_seq != self.recv.nxt {
-                    return Ok(());
+                    return Ok(self.availability());
                 }
             }
             (0, _) => {
@@ -299,7 +327,7 @@ impl Connection {
                     self.recv.nxt.wrapping_add(self.recv.wnd as u32),
                 ) {
                     // TODO: Send ACK
-                    return Ok(());
+                    return Ok(self.availability());
                 }
             }
             (_, 0) => {
@@ -307,7 +335,7 @@ impl Connection {
                 // allowance should be made to accept valid ACKs, URGs, and RSTs.
 
                 // TODO: Send ACK
-                return Ok(());
+                return Ok(self.availability());
             }
             (_, _) => {
                 if !(is_in_range_wrap(
@@ -320,7 +348,7 @@ impl Connection {
                     self.recv.nxt.wrapping_add(self.recv.wnd as u32),
                 )) {
                     // TODO: Send ACK
-                    return Ok(());
+                    return Ok(self.availability());
                 }
             }
         }
@@ -337,12 +365,12 @@ impl Connection {
             // unsolicited general "connection reset" signal, enter the CLOSED state, delete
             // the TCB.
 
-            return Ok(());
+            return Ok(self.availability());
         }
 
         // Acceptable ACK check. (RFC 9293 - Section 4.3)
         if !tcphdr.ack() {
-            return Ok(());
+            return Ok(self.availability());
         }
 
         if let State::SynRcvd = self.state {
@@ -356,7 +384,7 @@ impl Connection {
                 // TODO:
                 // <SEQ=SEG.ACK><CTL=RST>
                 // Send it
-                return Ok(());
+                return Ok(self.availability());
             }
         }
 
@@ -382,13 +410,14 @@ impl Connection {
                     if !is_duplicate(self.send.una, seg_ack, self.send.nxt) {
                         // TODO: Send an ACK
                         self.write(nic, &[])?;
+                        return Ok(self.availability());
                     }
                     // if !self.state.is_synchronized() {
                     //     // Send RST (RFC 9293 - Section 3.5.1 - Group 2)
                     //     self.send_rst(nic, tcphdr, payload)?;
                     // }
 
-                    return Ok(());
+                    // Not yet sent
                 }
             }
         }
@@ -398,7 +427,7 @@ impl Connection {
         }
         if let State::FinWait2 = self.state {
             if tcphdr.fin() {
-                self.state = State::Closing;
+                self.state = State::TimeWait;
             }
         }
 
@@ -417,8 +446,10 @@ impl Connection {
         // Reset the tcp header flags regardless of the handler
         self.reset_tcphdr_flags();
         if let State::Estab = self.state {
-            self.tcphdr.fin = true;
-            self.state = State::FinWait1;
+            if tcphdr.fin() {
+                self.recv.nxt = self.recv.nxt.wrapping_add(1);
+                self.state = State::CloseWait;
+            }
         }
 
         let parsed = self.write(nic, payload)?;
@@ -426,7 +457,7 @@ impl Connection {
             .wrapping_add(parsed as u32)
             .wrapping_add(if tcphdr.fin() || tcphdr.syn() { 1 } else { 0 });
 
-        Ok(())
+        Ok(self.availability())
     }
 }
 

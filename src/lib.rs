@@ -12,6 +12,7 @@ use std::{
     thread,
 };
 
+// TODO: CHANGEME
 const TRANSMISSION_QLEN_SIZE: usize = 1000 * 1500;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -30,6 +31,8 @@ struct ConnectionManager {
 #[derive(Default, Debug)]
 struct ConnHandler {
     conn_manager: Mutex<ConnectionManager>,
+
+    // TODO: make the condvars per connection (i.e. per quad)
     pending_cvar: Condvar,
     receive_cvar: Condvar,
 }
@@ -102,12 +105,19 @@ fn packet_loop(mut nic: tun_tap::Iface, conn_handler: ConnectionHandler) -> io::
         };
         match cm.connections.entry(quad) {
             Entry::Occupied(mut connection) => {
-                connection
-                    .get_mut()
-                    .on_packet(&mut nic, &tcphdr, &buf[offset..len])?;
+                let available =
+                    connection
+                        .get_mut()
+                        .on_packet(&mut nic, &tcphdr, &buf[offset..len])?;
 
+                // TODO: compare before/after and do the following only if they differ
                 drop(cm_lock);
-                conn_handler.receive_cvar.notify_all();
+                if available.contains(tcp::Available::READ) {
+                    conn_handler.receive_cvar.notify_all();
+                }
+                if available.contains(tcp::Available::WRITE) {
+                    // TODO: do something similar to the receive_cvar
+                }
             }
             Entry::Vacant(entry) => {
                 if let Some(pending) = cm.pending.get_mut(&tcphdr.destination_port()) {
@@ -218,32 +228,39 @@ pub struct TcpStream {
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut cm = self.conn_handler.conn_manager.lock().unwrap();
-        let connection = cm.connections.get_mut(&self.quad).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "stream terminated unexpectedly!",
-            )
-        })?;
+        loop {
+            let connection = cm.connections.get(&self.quad).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "stream terminated unexpectedly",
+                )
+            })?;
 
-        if connection.inbuf.is_empty() {
-            // TODO: block
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "no bytes to read.",
-            ));
+            if connection.inbuf.is_empty() && connection.is_recv_closed() {
+                // no more data to read, close stream
+                return Ok(0);
+            }
+
+            if !connection.inbuf.is_empty() {
+                println!("-- Read awake");
+                let connection = cm.connections.get_mut(&self.quad).unwrap();
+
+                // TODO: detect FIN and return nread 0
+
+                let (head, tail) = connection.inbuf.as_slices();
+                let mut nread = std::cmp::min(head.len(), buf.len());
+                buf.copy_from_slice(&head[..nread]);
+                let tread = std::cmp::min(buf.len() - nread, tail.len());
+                buf.copy_from_slice(&tail[..tread]);
+                nread += tread;
+                drop(connection.inbuf.drain(..nread));
+
+                return Ok(nread);
+            }
+
+            println!("-- Read block");
+            cm = self.conn_handler.receive_cvar.wait(cm).unwrap();
         }
-
-        let (head, tail) = connection.inbuf.as_slices();
-        let mut nread = std::cmp::min(head.len(), buf.len());
-        buf.copy_from_slice(&head[..nread]);
-        let tread = std::cmp::min(buf.len() - nread, tail.len());
-        buf.copy_from_slice(&tail[..tread]);
-        nread += tread;
-        drop(connection.inbuf.drain(..nread));
-
-        drop(cm);
-
-        Ok(nread)
     }
 }
 
