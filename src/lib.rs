@@ -7,7 +7,7 @@ use std::{
         self,
         prelude::{Read, Write},
     },
-    net::{Ipv4Addr, ToSocketAddrs},
+    net::{Ipv4Addr, SocketAddrV4},
     sync::{Arc, Condvar, Mutex},
     thread,
 };
@@ -36,6 +36,7 @@ struct ConnHandler {
     pending_cvar: Condvar,
     receive_cvar: Condvar,
     send_cvar: Condvar,
+    estab_cvar: Condvar,
 }
 
 type ConnectionHandler = Arc<ConnHandler>;
@@ -183,6 +184,41 @@ impl Tcp {
             conn_handler: self.conn_handler.as_mut().unwrap().clone(),
         })
     }
+
+    /// Connects to a remote host
+    pub fn connect(&mut self, addr: SocketAddrV4) -> io::Result<TcpStream> {
+        let my_ip: Ipv4Addr = std::env::var("MY_IP")
+            .unwrap()
+            .parse()
+            .expect("local host doesn't have a valid IP");
+        let quad = Quad {
+            local: (my_ip, 9182u16),
+            remote: (addr.ip().to_owned(), addr.port()),
+        };
+        let connection = tcp::Connection::establish_connection(quad.remote.0, quad.remote.1)?;
+        let conn_handler = self.conn_handler.as_mut().unwrap().clone();
+        let mut cm = conn_handler.conn_manager.lock().unwrap();
+
+        assert!(cm.connections.insert(quad, connection).is_none());
+
+        loop {
+            let connection = cm.connections.get(&quad).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "stream terminated unexpectedly",
+                )
+            })?;
+
+            if connection.is_established() {
+                return Ok(TcpStream {
+                    quad,
+                    conn_handler: self.conn_handler.as_ref().unwrap().clone(),
+                });
+            }
+
+            cm = conn_handler.estab_cvar.wait(cm).unwrap();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -313,10 +349,6 @@ impl Write for TcpStream {
 }
 
 impl TcpStream {
-    pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
-        // TODO: https://github.com/rust-lang/rust/blob/19a1d2b404e9f56eb1792cc06ec3c86b5a260b41/library/std/src/sys_common/net.rs#L230
-        unimplemented!()
-    }
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
         // TODO: send a FIN
         unimplemented!()

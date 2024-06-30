@@ -4,8 +4,11 @@ use std::{
     cmp::Ordering,
     collections::VecDeque,
     io::{self, Write},
+    net::Ipv4Addr,
 };
 use tun_tap::Iface;
+
+// TODO: use lazy_static for the nic
 
 bitflags! {
     pub(crate) struct Available: u8 {
@@ -17,6 +20,7 @@ bitflags! {
 #[derive(Debug)]
 pub enum State {
     SynRcvd,
+    SynSent,
     Estab,
     FinWait1,
     FinWait2,
@@ -73,6 +77,14 @@ impl Connection {
             true
         } else {
             false
+        }
+    }
+
+    pub(crate) fn is_established(&self) -> bool {
+        if let State::Closed | State::SynRcvd | State::SynSent = self.state {
+            false
+        } else {
+            true
         }
     }
 }
@@ -325,6 +337,32 @@ impl Connection {
         let seg_ack = tcphdr.acknowledgment_number();
         let seg_wnd = tcphdr.window_size();
         let seg_len = payload.len() as u32 + if tcphdr.syn() || tcphdr.fin() { 1 } else { 0 };
+        if let State::SynSent = self.state {
+            if !is_in_range_wrap(self.send.iss, seg_ack, self.send.nxt.wrapping_add(1))
+                && !is_in_range_wrap(
+                    self.send.una.wrapping_add(1),
+                    seg_ack,
+                    self.send.nxt.wrapping_add(1),
+                )
+            {
+                if tcphdr.rst() {
+                    return Ok(self.availability());
+                }
+                // TODO: send a reset
+                return Ok(self.availability());
+            }
+
+            if !tcphdr.syn() {
+                return Ok(self.availability());
+            }
+            self.recv.nxt = seg_seq.wrapping_add(1);
+            self.recv.irs = seg_seq;
+            self.send.una = seg_ack;
+            self.state = State::Estab;
+            self.reset_tcphdr_flags();
+            self.write(nic, payload)?;
+            return Ok(self.availability());
+        }
         match (seg_len, self.recv.wnd) {
             (0, 0) => {
                 if seg_seq != self.recv.nxt {
@@ -484,6 +522,55 @@ impl Connection {
             .wrapping_add(if tcphdr.fin() || tcphdr.syn() { 1 } else { 0 });
 
         Ok(self.availability())
+    }
+
+    pub(crate) fn establish_connection(remote_ip: Ipv4Addr, remote_port: u16) -> io::Result<Self> {
+        let local_ip: Ipv4Addr = (std::env::var("MY_IP").unwrap()).parse().unwrap();
+        let local_port = 9182u16;
+
+        let iss = 0;
+        let wnd = 0;
+        let ttl = 64;
+        let mut tcphdr = TcpHeader::new(local_port, remote_port, iss, wnd);
+        tcphdr.syn = true;
+        let iphdr = Ipv4Header::new(
+            tcphdr.header_len().wrapping_add(1) as u16,
+            ttl,
+            IpNumber::TCP,
+            local_ip.octets(),
+            remote_ip.octets(),
+        )
+        .expect("Invalid IP Header data");
+
+        tcphdr.checksum = tcphdr
+            .calc_checksum_ipv4(&iphdr, &[])
+            .expect("Invalid IP header");
+
+        let connection = Connection {
+            state: State::SynSent,
+            send: SendSequenceSpace {
+                una: 0,
+                nxt: iss + 1,
+                wnd,
+                iss,
+                up: false,
+                wl1: 0,
+                wl2: 0,
+            },
+            recv: RecvSequenceSpace {
+                nxt: 0,
+                wnd: 0,
+                up: false,
+                irs: 0,
+            },
+            iphdr,
+            tcphdr,
+            inbuf: VecDeque::default(),
+            outbuf: VecDeque::default(),
+        };
+
+        // TODO: send the first SYN packet
+        Ok(connection)
     }
 }
 
