@@ -9,6 +9,7 @@ edition = "2021"
 tun-tap = "0.1.4"
 etherparse = "0.15.0"
 bitflags = "2.6.0"
+nix = { version = "0.29.0", features = ["poll"] }
 
 [lib]
 name = "ruts_tcp"

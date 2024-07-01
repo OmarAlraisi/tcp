@@ -8,7 +8,8 @@ use std::{
         prelude::{Read, Write},
     },
     net::{Ipv4Addr, SocketAddrV4},
-    sync::{Arc, Condvar, Mutex},
+    os::fd::BorrowedFd,
+    sync::{Arc, Condvar, Mutex, OnceLock},
     thread,
 };
 
@@ -66,12 +67,23 @@ impl Drop for Tcp {
     }
 }
 
-fn packet_loop(mut nic: tun_tap::Iface, conn_handler: ConnectionHandler) -> io::Result<()> {
+fn packet_loop(conn_handler: ConnectionHandler) -> io::Result<()> {
     let mut buf = [0u8; 1500];
+    let nic = NIC::get_mut_ref()?;
     loop {
+        use nix::poll;
+        use std::os::unix::io::AsRawFd;
+        let mut pfd = unsafe {
+            [poll::PollFd::new(
+                BorrowedFd::borrow_raw(nic.lock().unwrap().as_raw_fd()),
+                poll::PollFlags::POLLIN,
+            )]
+        };
+        let n = poll::poll(&mut pfd[..], poll::PollTimeout::from(19u8))?;
+        assert_ne!(n, -1);
         // Read from the tunnel nic
         // TODO: Set timeout for the recv
-        let len = nic.recv(&mut buf)?;
+        let len = nic.lock().unwrap().recv(&mut buf)?;
 
         // TODO: if conn_manager.terminate && Arc get_strong_refs(conn_manager) == 1; then tear
         // down all connections and return.
@@ -107,10 +119,7 @@ fn packet_loop(mut nic: tun_tap::Iface, conn_handler: ConnectionHandler) -> io::
         };
         match cm.connections.entry(quad) {
             Entry::Occupied(mut connection) => {
-                let available =
-                    connection
-                        .get_mut()
-                        .on_packet(&mut nic, &tcphdr, &buf[offset..len])?;
+                let available = connection.get_mut().on_packet(&tcphdr, &buf[offset..len])?;
 
                 // remove the connection from the connections map if closed
                 if connection.get().is_closed() {
@@ -129,7 +138,7 @@ fn packet_loop(mut nic: tun_tap::Iface, conn_handler: ConnectionHandler) -> io::
             }
             Entry::Vacant(entry) => {
                 if let Some(pending) = cm.pending.get_mut(&tcphdr.destination_port()) {
-                    if let Some(connection) = tcp::Connection::accept(&mut nic, &iphdr, &tcphdr)? {
+                    if let Some(connection) = tcp::Connection::accept(&iphdr, &tcphdr)? {
                         entry.insert(connection);
                         pending.push_front(quad);
                         drop(cm_lock);
@@ -141,14 +150,41 @@ fn packet_loop(mut nic: tun_tap::Iface, conn_handler: ConnectionHandler) -> io::
     }
 }
 
+struct NIC;
+
+impl NIC {
+    fn init() -> io::Result<()> {
+        let nic = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
+        unsafe {
+            NIC_ONCE_LOCK
+                .set(Arc::new(Mutex::new(nic)))
+                .expect("failed to set NIC");
+        }
+        Ok(())
+    }
+
+    fn get_mut_ref() -> io::Result<Arc<Mutex<tun_tap::Iface>>> {
+        let nic;
+        unsafe {
+            nic = NIC_ONCE_LOCK
+                .get_mut()
+                .expect("failed to get mutable reference to the NIC")
+                .clone();
+        }
+        Ok(nic)
+    }
+}
+
+pub(crate) static mut NIC_ONCE_LOCK: OnceLock<Arc<Mutex<tun_tap::Iface>>> = OnceLock::new();
+
 impl Tcp {
     /// Creates a new NIC and initializes the connection manager state
     pub fn init() -> io::Result<Self> {
-        let nic = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
+        NIC::init()?;
         let conn_handler: ConnectionHandler = Arc::default();
         let join_handler = {
             let cm = conn_handler.clone();
-            thread::spawn(move || packet_loop(nic, cm))
+            thread::spawn(move || packet_loop(cm))
         };
         Ok(Tcp {
             conn_handler: Some(conn_handler),
@@ -202,6 +238,7 @@ impl Tcp {
         assert!(cm.connections.insert(quad, connection).is_none());
 
         loop {
+            println!("commonman");
             let connection = cm.connections.get(&quad).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -210,6 +247,7 @@ impl Tcp {
             })?;
 
             if connection.is_established() {
+                println!("finally");
                 return Ok(TcpStream {
                     quad,
                     conn_handler: self.conn_handler.as_ref().unwrap().clone(),

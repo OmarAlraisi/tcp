@@ -6,9 +6,8 @@ use std::{
     io::{self, Write},
     net::Ipv4Addr,
 };
-use tun_tap::Iface;
 
-// TODO: use lazy_static for the nic
+use crate::NIC;
 
 bitflags! {
     pub(crate) struct Available: u8 {
@@ -150,7 +149,7 @@ struct RecvSequenceSpace {
 impl Connection {
     /// Takes a nic and payload and writes an IP packet to the nic
     /// Returns a result containing the number of payload bytes written to the nic
-    fn write(&mut self, nic: &mut Iface, payload: &[u8]) -> io::Result<usize> {
+    fn write(&mut self, payload: &[u8]) -> io::Result<usize> {
         self.tcphdr.ack = true;
         let mut buf = [0u8; 1500];
 
@@ -185,7 +184,10 @@ impl Connection {
             let payload_bytes = unwritten.write(payload)?;
             (unwritten.len(), payload_bytes)
         };
-        nic.send(&buf[..buf.len() - unwritten])?;
+        NIC::get_mut_ref()?
+            .lock()
+            .unwrap()
+            .send(&buf[..buf.len() - unwritten])?;
 
         // Update the send next sequence number
         self.send.nxt = self
@@ -278,7 +280,6 @@ impl Connection {
 
     /// When accepting a new connection
     pub fn accept<'a>(
-        nic: &mut Iface,
         iphdr: &'a Ipv4HeaderSlice,
         tcphdr: &'a TcpHeaderSlice,
     ) -> io::Result<Option<Self>> {
@@ -321,14 +322,13 @@ impl Connection {
         connection.tcphdr.syn = true;
         connection.tcphdr.ack = true;
 
-        connection.write(nic, &[])?;
+        connection.write(&[])?;
 
         Ok(Some(connection))
     }
 
     pub(crate) fn on_packet<'a>(
         &mut self,
-        nic: &mut Iface,
         tcphdr: &'a TcpHeaderSlice,
         payload: &[u8],
     ) -> io::Result<Available> {
@@ -360,7 +360,7 @@ impl Connection {
             self.send.una = seg_ack;
             self.state = State::Estab;
             self.reset_tcphdr_flags();
-            self.write(nic, payload)?;
+            self.write(payload)?;
             return Ok(self.availability());
         }
         match (seg_len, self.recv.wnd) {
@@ -458,7 +458,7 @@ impl Connection {
                 } else {
                     if !is_duplicate(self.send.una, seg_ack, self.send.nxt) {
                         // TODO: Send an ACK
-                        self.write(nic, &[])?;
+                        self.write(&[])?;
                         return Ok(self.availability());
                     }
                     // if !self.state.is_synchronized() {
@@ -516,7 +516,7 @@ impl Connection {
             self.state = State::Closed;
         }
 
-        let parsed = self.write(nic, payload)?;
+        let parsed = self.write(payload)?;
         self.recv.nxt = seg_seq
             .wrapping_add(parsed as u32)
             .wrapping_add(if tcphdr.fin() || tcphdr.syn() { 1 } else { 0 });
@@ -546,7 +546,7 @@ impl Connection {
             .calc_checksum_ipv4(&iphdr, &[])
             .expect("Invalid IP header");
 
-        let connection = Connection {
+        let mut connection = Connection {
             state: State::SynSent,
             send: SendSequenceSpace {
                 una: 0,
@@ -569,7 +569,7 @@ impl Connection {
             outbuf: VecDeque::default(),
         };
 
-        // TODO: send the first SYN packet
+        connection.write(&[])?;
         Ok(connection)
     }
 }
