@@ -79,7 +79,7 @@ fn packet_loop(conn_handler: ConnectionHandler) -> io::Result<()> {
                 poll::PollFlags::POLLIN,
             )]
         };
-        let n = poll::poll(&mut pfd[..], poll::PollTimeout::from(19u8))?;
+        let n = poll::poll(&mut pfd[..], poll::PollTimeout::from(10u8))?;
         assert_ne!(n, -1);
         // Read from the tunnel nic
         // TODO: Set timeout for the recv
@@ -238,7 +238,6 @@ impl Tcp {
         assert!(cm.connections.insert(quad, connection).is_none());
 
         loop {
-            println!("commonman");
             let connection = cm.connections.get(&quad).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -346,25 +345,32 @@ impl Read for TcpStream {
 impl Write for TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut cm = self.conn_handler.conn_manager.lock().unwrap();
-
-        loop {
-            let connection = cm.connections.get_mut(&self.quad).ok_or_else(|| {
+        while cm
+            .connections
+            .get(&self.quad)
+            .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::ConnectionAborted,
                     "stream terminated unexpectedly!",
                 )
-            })?;
-
-            if connection.outbuf.len() < TRANSMISSION_QLEN_SIZE {
-                let nwrite =
-                    std::cmp::min(buf.len(), TRANSMISSION_QLEN_SIZE - connection.outbuf.len());
-                connection.outbuf.extend(&buf[..nwrite]);
-
-                return Ok(nwrite);
-            }
-
+            })?
+            .outbuf
+            .len()
+            >= TRANSMISSION_QLEN_SIZE
+        {
             cm = self.conn_handler.send_cvar.wait(cm).unwrap();
         }
+
+        let connection = cm.connections.get_mut(&self.quad).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "stream terminated unexpectedly!",
+            )
+        })?;
+        let nwrite = std::cmp::min(buf.len(), TRANSMISSION_QLEN_SIZE - connection.outbuf.len());
+        connection.outbuf.extend(&buf[..nwrite]);
+
+        Ok(nwrite)
     }
 
     fn flush(&mut self) -> io::Result<()> {
